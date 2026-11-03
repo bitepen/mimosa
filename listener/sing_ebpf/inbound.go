@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
