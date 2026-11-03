@@ -108,7 +108,6 @@ jobs:
       - name: Build mihomo for Android arm64
         run: |
           go clean -cache
-          make ebpf_generate
           go build -v -tags "with_gvisor with_ebpf" -trimpath \
             -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
                       -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
