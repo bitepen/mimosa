@@ -225,3 +225,55 @@ func (i *Inbound) bypassRuleSetBackendRequiresRebuildLocked() bool {
 	}
 	return false
 }
+
+// 以下是新引入的内核墓碑机制
+// -------------------------------------------------------------
+// 追加在 policy.go 最底部
+// -------------------------------------------------------------
+
+var (
+	allIPv4Prefix = netip.MustParsePrefix("0.0.0.0/0")
+	allIPv6Prefix = netip.MustParsePrefix("::/0")
+)
+
+// SetScreenOffBypass 动态切换 eBPF 内核放手状态
+// bypassAll=true: 向内核写入全 0 网段，所有流量原地直连放行
+// bypassAll=false: 重新下发原有的分流规则和私有 IP 拦截策略
+func (i *Inbound) SetScreenOffBypass(bypassAll bool) error {
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+
+	// 亮屏或透气恢复：直接复用文件里原有的刷新函数
+	if !bypassAll {
+		err := i.refreshBypassCIDRsLocked()
+		if err == nil {
+			log.Infoln("[EBPF] Screen ON/Breathe: Restored normal interception")
+		}
+		return err
+	}
+
+	// 熄屏放手：构造 0.0.0.0/0 和 ::/0，动作全部设为 DecisionPass
+	allPassDecisions := []ECommon.CIDRDecision{
+		{Prefix: allIPv4Prefix, Action: ECommon.DecisionPass},
+		{Prefix: allIPv6Prefix, Action: ECommon.DecisionPass},
+	}
+
+	// 1. 如果启用了 cgroup 模式，更新 cgroup 的 DestinationDecisions Map
+	if backend := i.cgroupBackendInstance(); backend != nil {
+		if _, err := backend.UpdateDestinationDecisions(allPassDecisions); err != nil {
+			return err
+		}
+	}
+
+	// 2. 如果启用了 TC 模式，同步更新 TC 的 Local Map
+	if backend := i.tcBackend(); backend != nil {
+		if i.localTCEnabled() {
+			if _, err := backend.UpdateLocalDestinationDecisions(allPassDecisions); err != nil {
+				return err
+			}
+		}
+	}
+
+	log.Infoln("[EBPF] Screen OFF: Kernel eBPF bypassed (pass all)")
+	return nil
+}

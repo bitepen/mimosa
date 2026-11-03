@@ -1,0 +1,139 @@
+name: Auto Sync Upstream & Build Saver
+
+on:
+  schedule:
+    # 每天北京时间早上 06:00 (UTC 22:00) 自动检查同步
+    - cron: '0 22 * * *'
+  workflow_dispatch: # 支持网页随时手动一键触发
+
+concurrency:
+  group: sync-build-saver
+  cancel-in-progress: true
+
+# 授予创建和更新 Release 的必要写权限
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.check_updates.outputs.has_updates }}
+    steps:
+      - name: Checkout saver branch
+        uses: actions/checkout@v6
+        with:
+          ref: saver
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Upstream
+        run: |
+          git remote add upstream https://github.com/MetaCubeX/mihomo.git
+          git fetch upstream Alpha
+
+      - name: Check if upstream has new commits
+        id: check_updates
+        run: |
+          UPSTREAM_REV=$(git rev-parse upstream/Alpha)
+          LOCAL_BASE=$(git merge-base HEAD upstream/Alpha)
+          if [ "$UPSTREAM_REV" = "$LOCAL_BASE" ]; then
+            echo "上游没有新提交，无需更新与构建。"
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          else
+            echo "检测到上游新提交，准备同步..."
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Rebase saver on upstream
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          if git rebase upstream/Alpha; then
+            echo "Rebase 成功，推送回 origin saver 分支..."
+            git push origin saver --force-with-lease
+          else
+            echo "::error::Rebase 遇到冲突，自动终止！请在本地手动解决冲突。"
+            git rebase --abort
+            exit 1
+          fi
+
+  build-android:
+    needs: sync-upstream
+    if: ${{ needs.sync-upstream.outputs.has_updates == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout updated saver branch
+        uses: actions/checkout@v6
+        with:
+          ref: saver
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
+          go-version: '1.26'
+
+      - name: Download dependencies
+        run: |
+          go mod download
+          go mod tidy
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29-beta1
+
+      - name: Set NDK environment
+        run: |
+          NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
+          echo "CC=${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang" >> $GITHUB_ENV
+          echo "CGO_ENABLED=1" >> $GITHUB_ENV
+          echo "GOOS=android" >> $GITHUB_ENV
+          echo "GOARCH=arm64" >> $GITHUB_ENV
+
+          # 提取 8 位 Git commit short hash
+          SHORT_HASH=$(git rev-parse --short=8 HEAD)
+          BUILD_DATE=$(date +'%Y%m%d')
+
+          # 核心版本号修改为 Lighty-Saver-XXXXXX
+          echo "VERSION=Lighty-Saver-${SHORT_HASH}" >> $GITHUB_ENV
+          echo "TAG_NAME=saver-${BUILD_DATE}-${SHORT_HASH}" >> $GITHUB_ENV
+          echo "BUILDTIME=$(date)" >> $GITHUB_ENV
+
+      - name: Build mihomo for Android arm64
+        run: |
+          go clean -cache
+          make ebpf_generate
+          go build -v -tags "with_gvisor with_ebpf" -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
+                      -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
+                      -w -s -buildid=" \
+            -o mihomo
+
+      - name: Strip & Compress binary
+        run: |
+          NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
+          ${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-all mihomo
+          gzip -c mihomo > mihomo-android-arm64-${VERSION}.gz
+          # 同时保留一份不带版本号的固定文件名，方便固定链接下载
+          cp mihomo-android-arm64-${VERSION}.gz mihomo-android-arm64-latest.gz
+          sha256sum mihomo-android-arm64-${VERSION}.gz > mihomo-android-arm64.sha256
+
+      # 每次生成独立 Release
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: "Mihomo Saver ${{ env.TAG_NAME }}"
+          prerelease: false
+          draft: false
+          files: |
+            mihomo-android-arm64-${{ env.VERSION }}.gz
+            mihomo-android-arm64.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

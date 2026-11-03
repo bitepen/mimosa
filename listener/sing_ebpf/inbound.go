@@ -3,10 +3,12 @@
 package sing_ebpf
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net/netip"
+	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -575,6 +577,7 @@ func (i *Inbound) start() error {
 		network = "udp"
 	}
 	i.logInboundReady(network, defaultInterface, localInterface, sharedInterfaces, dataPlane)
+	i.startPowerWatcher()
 	return nil
 }
 
@@ -890,4 +893,87 @@ func (s *sharedRewrite) dataPlaneInstance() sharedKernelRuntime {
 
 func (i *Inbound) warnIfLocalFakeIPICMPIPv6Unroutable(string) {
 	// mihomo does not surface the fakeip_icmp IPv6 route diagnostic.
+}
+
+// -------------------------------------------------------------
+// 追加在 inbound.go 最底部
+// -------------------------------------------------------------
+
+func (i *Inbound) startPowerWatcher() {
+	go func() {
+		log.Infoln("[EBPF] Power watcher started (screen-off auto bypass)")
+		// 监听系统事件日志中的 screen_toggled（0=灭屏，1=亮屏）
+		cmd := exec.CommandContext(i.ctx, "logcat", "-b", "events", "-v", "raw", "-s", "screen_toggled")
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Warnln("[EBPF] Failed to start logcat screen watcher: %v", err)
+			return
+		}
+		if err := cmd.Start(); err != nil {
+			log.Warnln("[EBPF] Failed to run logcat command: %v", err)
+			return
+		}
+		defer cmd.Process.Kill()
+
+		scanner := bufio.NewScanner(stdout)
+		var breatheTimer *time.Timer
+		isScreenOff := false
+
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+
+			// 收到灭屏事件
+			if strings.HasSuffix(line, " 0") {
+				isScreenOff = true
+
+				// 检查后台是否在播放音频
+				if i.isAudioPlaying() {
+					log.Debugln("[EBPF] Screen off, but audio is active; skip bypass")
+					continue
+				}
+
+				// 1. 内核立即全量放手
+				_ = i.SetScreenOffBypass(true)
+
+				// 2. 启动 30 分钟透气定时器
+				if breatheTimer != nil {
+					breatheTimer.Stop()
+				}
+				breatheTimer = time.AfterFunc(30*time.Minute, func() {
+					if !isScreenOff {
+						return
+					}
+					log.Infoln("[EBPF] 30 minutes reached: Breathing for 60s...")
+					// 恢复拦截供后台应用拉取消息
+					_ = i.SetScreenOffBypass(false)
+
+					time.Sleep(60 * time.Second)
+
+					// 60秒透气结束，若屏幕依然关闭且没听歌，重新放手
+					if isScreenOff && !i.isAudioPlaying() {
+						_ = i.SetScreenOffBypass(true)
+					}
+				})
+
+			// 收到亮屏事件
+			} else if strings.HasSuffix(line, " 1") {
+				isScreenOff = false
+				if breatheTimer != nil {
+					breatheTimer.Stop()
+				}
+				// 亮屏瞬间原子恢复拦截
+				_ = i.SetScreenOffBypass(false)
+			}
+		}
+	}()
+}
+
+// 检查系统当前是否有音频正在播放
+func (i *Inbound) isAudioPlaying() bool {
+	out, err := exec.Command("dumpsys", "audio").Output()
+	if err != nil {
+		return false
+	}
+	s := string(out)
+	return strings.Contains(s, "state=PLAYING") || strings.Contains(s, "Standby: no")
 }
