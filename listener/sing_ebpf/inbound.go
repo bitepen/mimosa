@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -903,8 +904,6 @@ func (i *Inbound) startPowerWatcher() {
 	go func() {
 		log.Infoln("[EBPF] Power watcher started (screen-off auto bypass)")
 
-		// 去掉 -v raw，改用标准格式输出；加入 -T 1 忽略开机以来的陈旧历史，只监听新事件
-		// 同时订阅 screen_toggled 与 power_screen_state 两个事件源
 		cmd := exec.CommandContext(i.ctx, "logcat", "-b", "events", "-T", "1", "-s", "screen_toggled", "power_screen_state")
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -918,65 +917,108 @@ func (i *Inbound) startPowerWatcher() {
 		defer cmd.Process.Kill()
 
 		scanner := bufio.NewScanner(stdout)
+
+		// 使用原子布尔与互斥锁，彻底杜绝多协程竞态与可见性失效
+		var isScreenOff atomic.Bool
+		var timerMu sync.Mutex
 		var breatheTimer *time.Timer
-		isScreenOff := false
+
+		// 辅助函数：安全调度 30 分钟透气计时器
+		scheduleBreathe := func() {
+			timerMu.Lock()
+			defer timerMu.Unlock()
+
+			if breatheTimer != nil {
+				breatheTimer.Stop()
+			}
+			breatheTimer = time.AfterFunc(30*time.Minute, func() {
+				if !isScreenOff.Load() {
+					return
+				}
+				log.Infoln("[EBPF] 30m reached: Breathing for 60s...")
+				_ = i.SetScreenOffBypass(false)
+
+				time.Sleep(60 * time.Second)
+
+				if isScreenOff.Load() && !i.isAudioPlaying() {
+					log.Infoln("[EBPF] Breathing finished; re-engaging kernel bypass")
+					_ = i.SetScreenOffBypass(true)
+				}
+			})
+		}
 
 		for scanner.Scan() {
 			line := scanner.Text()
 
-			// 只要包含以下任一特征，即判定为熄屏
 			isOff := strings.Contains(line, "screen_toggled: 0") || strings.Contains(line, "power_screen_state: [0,")
-			// 只要包含以下任一特征，即判定为亮屏
 			isOn := strings.Contains(line, "screen_toggled: 1") || strings.Contains(line, "power_screen_state: [1,")
 
 			if isOff {
-				// 避免重复触发
-				if isScreenOff {
+				// 状态防抖：已是灭屏状态则忽略连续触发
+				if isScreenOff.Swap(true) {
 					continue
 				}
-				isScreenOff = true
-				log.Infoln("[EBPF] Event caught: Screen OFF (%s)", line)
+				log.Infoln("[EBPF] Event caught: Screen OFF")
 
-				// 检查后台是否在播放音频
-				if i.isAudioPlaying() {
-					log.Infoln("[EBPF] Screen off, but audio is playing; keeping interception")
-					continue
-				}
+				// 将所有采样与放手决策转入独立异步任务，确保主 scanner 循环零等待
+				go func() {
+					speedKB := i.currentDownloadSpeedKB()
+					isPlaying := i.isAudioPlaying()
 
-				// 1. 内核立即全量放手
-				if err := i.SetScreenOffBypass(true); err != nil {
-					log.Warnln("[EBPF] Failed to engage screen-off bypass: %v", err)
-				}
-
-				// 2. 开启 30 分钟透气计时器
-				if breatheTimer != nil {
-					breatheTimer.Stop()
-				}
-				breatheTimer = time.AfterFunc(30*time.Minute, func() {
-					if !isScreenOff {
+					// 异步期间如果屏幕已被重新点亮，立即弃权退出
+					if !isScreenOff.Load() {
 						return
 					}
-					log.Infoln("[EBPF] 30m reached: Breathing for 60s...")
-					_ = i.SetScreenOffBypass(false)
 
-					time.Sleep(60 * time.Second)
+					// 忙碌状态处理：音频放歌中或下载速率 > 300 KB/s
+					if isPlaying || speedKB > 300 {
+						log.Infoln("[EBPF] Screen off, but busy (speed=%d KB/s, audio=%v); starting watcher...", speedKB, isPlaying)
 
-					if isScreenOff && !i.isAudioPlaying() {
-						_ = i.SetScreenOffBypass(true)
+						ticker := time.NewTicker(30 * time.Second)
+						defer ticker.Stop()
+
+						for range ticker.C {
+							if !isScreenOff.Load() {
+								return
+							}
+
+							currSpeed := i.currentDownloadSpeedKB()
+							currAudio := i.isAudioPlaying()
+
+							if currSpeed < 100 && !currAudio {
+								log.Infoln("[EBPF] Traffic & audio idle during screen-off (speed=%d KB/s); engaging kernel bypass now", currSpeed)
+								if isScreenOff.Load() {
+									_ = i.SetScreenOffBypass(true)
+									scheduleBreathe()
+								}
+								return
+							}
+							log.Debugln("[EBPF] Still busy in background: %d KB/s, audio=%v", currSpeed, currAudio)
+						}
+						return
 					}
-				})
+
+					// 空闲状态处理：常规锁屏且无大流量，直接放手并启动透气
+					log.Infoln("[EBPF] Device idle; engaging kernel bypass immediately")
+					_ = i.SetScreenOffBypass(true)
+					scheduleBreathe()
+				}()
 
 			} else if isOn {
-				if !isScreenOff {
+				// 状态防抖：已是亮屏状态则忽略
+				if !isScreenOff.Swap(false) {
 					continue
 				}
-				isScreenOff = false
 				log.Infoln("[EBPF] Event caught: Screen ON (%s)", line)
 
+				// 取消透气定时器并瞬时恢复拦截
+				timerMu.Lock()
 				if breatheTimer != nil {
 					breatheTimer.Stop()
+					breatheTimer = nil
 				}
-				// 亮屏瞬间原子恢复拦截
+				timerMu.Unlock()
+
 				if err := i.SetScreenOffBypass(false); err != nil {
 					log.Warnln("[EBPF] Failed to restore normal interception: %v", err)
 				}
@@ -997,4 +1039,52 @@ func (i *Inbound) isAudioPlaying() bool {
 	}
 	s := string(out)
 	return strings.Contains(s, "state=PLAYING") || strings.Contains(s, "Standby: no")
+}
+
+// 读取 /proc/net/dev 获取所有物理网卡（排除 lo）的累计接收字节数
+func getRxBytes() (uint64, error) {
+	file, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	var totalRx uint64
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// 忽略表头和本地回环
+		if strings.HasPrefix(line, "Inter-") || strings.HasPrefix(line, "face") || strings.HasPrefix(line, "lo:") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			// 第二列为 rx_bytes（如果网卡名带冒号连在一起，需处理冒号）
+			bytesStr := parts[1]
+			if strings.Contains(parts[0], ":") && len(parts) > 1 {
+				fields := strings.Split(parts[0], ":")
+				if len(fields) == 2 && fields[1] != "" {
+					bytesStr = fields[1]
+				}
+			}
+			var rx uint64
+			fmt.Sscanf(bytesStr, "%d", &rx)
+			totalRx += rx
+		}
+	}
+	return totalRx, nil
+}
+
+// 采样 1 秒计算当前瞬时下载速率（单位：KB/s）
+func (i *Inbound) currentDownloadSpeedKB() uint64 {
+	rx1, err := getRxBytes()
+	if err != nil {
+		return 0
+	}
+	time.Sleep(1 * time.Second)
+	rx2, err := getRxBytes()
+	if err != nil || rx2 < rx1 {
+		return 0
+	}
+	return (rx2 - rx1) / 1024
 }
