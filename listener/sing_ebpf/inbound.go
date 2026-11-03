@@ -902,8 +902,10 @@ func (i *Inbound) warnIfLocalFakeIPICMPIPv6Unroutable(string) {
 func (i *Inbound) startPowerWatcher() {
 	go func() {
 		log.Infoln("[EBPF] Power watcher started (screen-off auto bypass)")
-		// 监听系统事件日志中的 screen_toggled（0=灭屏，1=亮屏）
-		cmd := exec.CommandContext(i.ctx, "logcat", "-b", "events", "-v", "raw", "-s", "screen_toggled")
+
+		// 去掉 -v raw，改用标准格式输出；加入 -T 1 忽略开机以来的陈旧历史，只监听新事件
+		// 同时订阅 screen_toggled 与 power_screen_state 两个事件源
+		cmd := exec.CommandContext(i.ctx, "logcat", "-b", "events", "-T", "1", "-s", "screen_toggled", "power_screen_state")
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			log.Warnln("[EBPF] Failed to start logcat screen watcher: %v", err)
@@ -920,22 +922,33 @@ func (i *Inbound) startPowerWatcher() {
 		isScreenOff := false
 
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
+			line := scanner.Text()
 
-			// 收到灭屏事件
-			if strings.HasSuffix(line, " 0") {
+			// 只要包含以下任一特征，即判定为熄屏
+			isOff := strings.Contains(line, "screen_toggled: 0") || strings.Contains(line, "power_screen_state: [0,")
+			// 只要包含以下任一特征，即判定为亮屏
+			isOn := strings.Contains(line, "screen_toggled: 1") || strings.Contains(line, "power_screen_state: [1,")
+
+			if isOff {
+				// 避免重复触发
+				if isScreenOff {
+					continue
+				}
 				isScreenOff = true
+				log.Infoln("[EBPF] Event caught: Screen OFF (%s)", line)
 
 				// 检查后台是否在播放音频
 				if i.isAudioPlaying() {
-					log.Debugln("[EBPF] Screen off, but audio is active; skip bypass")
+					log.Infoln("[EBPF] Screen off, but audio is playing; keeping interception")
 					continue
 				}
 
 				// 1. 内核立即全量放手
-				_ = i.SetScreenOffBypass(true)
+				if err := i.SetScreenOffBypass(true); err != nil {
+					log.Warnln("[EBPF] Failed to engage screen-off bypass: %v", err)
+				}
 
-				// 2. 启动 30 分钟透气定时器
+				// 2. 开启 30 分钟透气计时器
 				if breatheTimer != nil {
 					breatheTimer.Stop()
 				}
@@ -943,27 +956,35 @@ func (i *Inbound) startPowerWatcher() {
 					if !isScreenOff {
 						return
 					}
-					log.Infoln("[EBPF] 30 minutes reached: Breathing for 60s...")
-					// 恢复拦截供后台应用拉取消息
+					log.Infoln("[EBPF] 30m reached: Breathing for 60s...")
 					_ = i.SetScreenOffBypass(false)
 
 					time.Sleep(60 * time.Second)
 
-					// 60秒透气结束，若屏幕依然关闭且没听歌，重新放手
 					if isScreenOff && !i.isAudioPlaying() {
 						_ = i.SetScreenOffBypass(true)
 					}
 				})
 
-			// 收到亮屏事件
-			} else if strings.HasSuffix(line, " 1") {
+			} else if isOn {
+				if !isScreenOff {
+					continue
+				}
 				isScreenOff = false
+				log.Infoln("[EBPF] Event caught: Screen ON (%s)", line)
+
 				if breatheTimer != nil {
 					breatheTimer.Stop()
 				}
 				// 亮屏瞬间原子恢复拦截
-				_ = i.SetScreenOffBypass(false)
+				if err := i.SetScreenOffBypass(false); err != nil {
+					log.Warnln("[EBPF] Failed to restore normal interception: %v", err)
+				}
 			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Warnln("[EBPF] Logcat event scanner exited: %v", err)
 		}
 	}()
 }
